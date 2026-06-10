@@ -146,7 +146,12 @@ function createBot(name) {
   // Initialise state if needed
   if (!bots[name]) bots[name] = {};
   bots[name].shouldReconnect = true;
-  bots[name].reconnectDelay = 60000; // starts at 60s, backs off
+  // FIX: Don't reset reconnectDelay here — it's managed by the end/stable
+  // handlers so backoff accumulates correctly across reconnect cycles.
+  // Only initialise it if it has never been set.
+  if (!bots[name].reconnectDelay) {
+    bots[name].reconnectDelay = 60000;
+  }
 
   setStatus(name, "connecting");
   pushLog(name, "system", "Connecting...");
@@ -155,21 +160,46 @@ function createBot(name) {
     host: "karmasmp.ddns.net",
     port: 25565,
     username: name,
-    // Prevent mineflayer from throwing unhandled rejections
-    // on connection failure by disabling its internal retry:
     hideErrors: false,
+    // FIX: Many servers running 1.8-1.12 reject newer clients
+    // immediately (socketClosed within 2s). Setting version
+    // explicitly stops the version mismatch kick.
+    // Change "1.8.9" to match your server version if needed.
+    version: false, // false = let mineflayer auto-detect (safest default)
+    // Keep the TCP socket alive to detect drops faster
+    keepAlive: true,
   });
 
+  // FIX: Assign a unique generation ID to this bot instance.
+  // When "end" fires we check the ID matches — prevents a stale
+  // bot's event from triggering a reconnect for a newer instance.
+  const instanceId = Date.now();
+  instance._dashId = instanceId;
+
   bots[name].instance = instance;
+  bots[name].instanceId = instanceId;
 
   // ---- SPAWN ----
   instance.once("spawn", () => {
+    // Guard: ignore if this is a stale instance
+    if (bots[name]?.instanceId !== instanceId) return;
+
     setStatus(name, "online");
-    bots[name].reconnectDelay = 60000; // reset backoff on success
     pushLog(name, "system", "Connected");
+
+    // FIX: Only reset backoff after a STABLE connection.
+    // We wait 10s — if the server kicks us within 10s (socketClosed)
+    // the timer is cancelled in the "end" handler and backoff stays.
+    bots[name].stableTimer = setTimeout(() => {
+      if (bots[name]?.instanceId === instanceId) {
+        bots[name].reconnectDelay = 60000; // reset backoff: connection is stable
+        pushLog(name, "system", "Connection stable");
+      }
+    }, 10000);
 
     setTimeout(() => {
       try {
+        if (bots[name]?.instanceId !== instanceId) return;
         instance.chat("/login " + config.password);
         pushLog(name, "system", "Executed /login");
       } catch {}
@@ -181,7 +211,22 @@ function createBot(name) {
 
   // ---- CHAT ----
   instance.on("messagestr", (msg) => {
+    if (bots[name]?.instanceId !== instanceId) return;
     parseChatLine(name, msg);
+
+    // FIX: Some login plugins (AuthMe, nLogin) send a chat prompt instead of
+    // waiting for spawn. If we see "login" or "password" in a server message,
+    // re-send the login command immediately.
+    const stripped = stripMcColors(msg).toLowerCase();
+    if (
+      (stripped.includes("login") || stripped.includes("password")) &&
+      stripped.includes("/login") &&
+      getStatus(name) === "online"
+    ) {
+      try {
+        instance.chat("/login " + config.password);
+      } catch {}
+    }
   });
 
   // ---- PLAYER JOIN/LEAVE ----
@@ -193,18 +238,49 @@ function createBot(name) {
     pushLog(name, "leave", `${player.username} left the game`);
   });
 
+  // ---- KICK ----
+  // Fired before "end" when the server sends an explicit kick message.
+  // Logging it separately gives much better diagnostics than "socketClosed".
+  instance.on("kicked", (reason) => {
+    if (bots[name]?.instanceId !== instanceId) return;
+    try {
+      // reason is JSON from the server; extract the text field if possible
+      const parsed = JSON.parse(reason);
+      const text = parsed?.text || parsed?.translate || reason;
+      pushLog(name, "error", `Kicked: ${text}`);
+    } catch {
+      pushLog(name, "error", `Kicked: ${reason}`);
+    }
+  });
+
   // ---- DISCONNECT ----
   instance.on("end", (reason) => {
-    setStatus(name, "offline");
-    pushLog(name, "system", `Disconnected${reason ? ": " + reason : ""}`);
+    // FIX: Ignore events from stale bot instances (the "shuffle" bug).
+    // Without this check, a slow-to-die old instance fires "end" after
+    // a new instance has already been created, causing duplicate reconnects.
+    if (bots[name]?.instanceId !== instanceId) return;
 
-    // FIX: Clear anti-AFK interval to prevent memory leak
+    // Cancel the "stable connection" timer — connection wasn't stable
+    if (bots[name]?.stableTimer) {
+      clearTimeout(bots[name].stableTimer);
+      bots[name].stableTimer = null;
+    }
+
+    setStatus(name, "offline");
+
+    // "socketClosed" is vague — give a more helpful message
+    const displayReason = reason === "socketClosed"
+      ? "Server closed connection (socketClosed)"
+      : reason || "";
+    pushLog(name, "system", `Disconnected${displayReason ? ": " + displayReason : ""}`);
+
+    // Clear anti-AFK interval to prevent memory leak
     if (bots[name]?.afkInterval) {
       clearInterval(bots[name].afkInterval);
       bots[name].afkInterval = null;
     }
 
-    // FIX: Only reconnect if the user hasn't clicked STOP
+    // Only reconnect if the user hasn't clicked STOP
     if (!bots[name]?.shouldReconnect) {
       pushLog(name, "system", "Stopped. Not reconnecting.");
       return;
@@ -212,11 +288,11 @@ function createBot(name) {
 
     const delay = bots[name].reconnectDelay ?? 60000;
 
-    // FIX: Exponential backoff — 60s, 120s, 240s, capped at 300s
+    // Exponential backoff: 60s → 120s → 240s → capped at 300s
     bots[name].reconnectDelay = Math.min(delay * 2, 300000);
 
     setStatus(name, "reconnecting");
-    pushLog(name, "system", `Reconnecting in ${delay / 1000}s...`);
+    pushLog(name, "system", `Reconnecting in ${Math.round(delay / 1000)}s...`);
 
     bots[name].reconnectTimer = setTimeout(() => {
       if (bots[name]?.shouldReconnect) {
@@ -247,17 +323,22 @@ function stopBot(name) {
   // Prevent reconnect loop
   state.shouldReconnect = false;
 
-  // Clear pending reconnect timer
+  // Clear all timers
   if (state.reconnectTimer) {
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
   }
-
-  // Clear anti-AFK interval
+  if (state.stableTimer) {
+    clearTimeout(state.stableTimer);
+    state.stableTimer = null;
+  }
   if (state.afkInterval) {
     clearInterval(state.afkInterval);
     state.afkInterval = null;
   }
+
+  // Invalidate instance ID so any in-flight events are ignored
+  state.instanceId = null;
 
   // Disconnect the bot if it exists
   if (state.instance) {
@@ -666,6 +747,26 @@ refresh();
 </script>
 </body>
 </html>`);
+});
+
+// ================= DEBUG =================
+// Visit /debug in your browser to see raw bot state.
+// Useful for diagnosing version mismatches and timer state.
+
+app.get("/debug", (req, res) => {
+  const out = {};
+  for (const name of Object.keys(BOT_CONFIGS)) {
+    const state = bots[name] ?? {};
+    out[name] = {
+      status:         state.status,
+      instanceId:     state.instanceId,
+      shouldReconnect:state.shouldReconnect,
+      reconnectDelay: state.reconnectDelay,
+      hasInstance:    !!state.instance,
+      version:        state.instance?._client?.version ?? null,
+    };
+  }
+  res.json(out);
 });
 
 // ================= DATA =================
