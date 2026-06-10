@@ -1,0 +1,14 @@
+run = "node index.js"
+modules = ["nodejs-20"]
+
+[[ports]]
+localPort = 3000
+externalPort = 3001
+
+[nix]
+packages = ["nodejs"]
+
+[agent]
+expertMode = true
+
+[workflows]
