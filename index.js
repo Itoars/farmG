@@ -239,40 +239,40 @@ function createBot(name) {
   });
 
   // ---- KICK ----
-  // Fired before "end" when the server sends an explicit kick message.
-  // Logging it separately gives much better diagnostics than "socketClosed".
+  // Fired before "end" with the server's kick reason.
+  // We store the kick reason on the bot state so the "end"
+  // handler can choose the right reconnect delay for it.
   instance.on("kicked", (reason) => {
     if (bots[name]?.instanceId !== instanceId) return;
+
+    let text = reason;
     try {
-      // reason is JSON from the server; extract the text field if possible
+      // Server sends JSON — unwrap it to readable text
       const parsed = JSON.parse(reason);
-      const text = parsed?.text || parsed?.translate || reason;
-      pushLog(name, "error", `Kicked: ${text}`);
-    } catch {
-      pushLog(name, "error", `Kicked: ${reason}`);
-    }
+      text = parsed?.text || parsed?.translate || parsed?.extra?.[0]?.text || reason;
+      // Strip surrounding quotes if the JSON value was a plain string
+      text = text.replace(/^"|"$/g, "").trim();
+    } catch { /* reason was already plain text */ }
+
+    pushLog(name, "error", `Kicked: ${text}`);
+
+    // Store normalised kick reason for the "end" handler below
+    bots[name]._lastKick = text.toLowerCase();
   });
 
   // ---- DISCONNECT ----
   instance.on("end", (reason) => {
-    // FIX: Ignore events from stale bot instances (the "shuffle" bug).
-    // Without this check, a slow-to-die old instance fires "end" after
-    // a new instance has already been created, causing duplicate reconnects.
+    // Ignore events from stale bot instances (the "shuffle" bug)
     if (bots[name]?.instanceId !== instanceId) return;
 
-    // Cancel the "stable connection" timer — connection wasn't stable
+    // Cancel the stable-connection timer
     if (bots[name]?.stableTimer) {
       clearTimeout(bots[name].stableTimer);
       bots[name].stableTimer = null;
     }
 
     setStatus(name, "offline");
-
-    // "socketClosed" is vague — give a more helpful message
-    const displayReason = reason === "socketClosed"
-      ? "Server closed connection (socketClosed)"
-      : reason || "";
-    pushLog(name, "system", `Disconnected${displayReason ? ": " + displayReason : ""}`);
+    pushLog(name, "system", "Disconnected");
 
     // Clear anti-AFK interval to prevent memory leak
     if (bots[name]?.afkInterval) {
@@ -286,16 +286,47 @@ function createBot(name) {
       return;
     }
 
-    const delay = bots[name].reconnectDelay ?? 60000;
+    // ---- SMART DELAY BASED ON KICK REASON ----
+    // Read and clear the stored kick reason
+    const kick = bots[name]._lastKick ?? "";
+    bots[name]._lastKick = null;
 
-    // Exponential backoff: 60s → 120s → 240s → capped at 300s
-    bots[name].reconnectDelay = Math.min(delay * 2, 300000);
+    let delay;
+
+    if (kick.includes("throttl") || kick.includes("too many") || kick.includes("too fast")) {
+      // "Connection throttled! Please wait before reconnecting."
+      // Server is rate-limiting us. Wait 5 minutes and reset backoff
+      // so we start fresh from 60s rather than doubling a huge number.
+      delay = 5 * 60 * 1000; // 5 minutes
+      bots[name].reconnectDelay = 60000; // reset backoff after throttle wait
+      pushLog(name, "system", "⚠ Throttled by server. Waiting 5 minutes...");
+
+    } else if (kick.includes("same username") || kick.includes("already playing") || kick.includes("already logged")) {
+      // "The same username is already playing on the server!"
+      // Our previous session is still alive on the server.
+      // Wait 3 minutes for the server to time it out, then reconnect.
+      delay = 3 * 60 * 1000; // 3 minutes
+      bots[name].reconnectDelay = 60000; // reset backoff after session wait
+      pushLog(name, "system", "⚠ Duplicate session on server. Waiting 3 minutes for it to expire...");
+
+    } else {
+      // Normal disconnect — use exponential backoff
+      delay = bots[name].reconnectDelay ?? 60000;
+      // Double for next time, cap at 5 minutes
+      bots[name].reconnectDelay = Math.min(delay * 2, 300000);
+    }
 
     setStatus(name, "reconnecting");
-    pushLog(name, "system", `Reconnecting in ${Math.round(delay / 1000)}s...`);
+    const delaySec = Math.round(delay / 1000);
+    const delayLabel = delaySec >= 60 ? `${Math.round(delaySec / 60)}m` : `${delaySec}s`;
+    pushLog(name, "system", `Reconnecting in ${delayLabel}...`);
+
+    // Store the epoch time when the next attempt fires — used for countdown
+    bots[name].reconnectAt = Date.now() + delay;
 
     bots[name].reconnectTimer = setTimeout(() => {
       if (bots[name]?.shouldReconnect) {
+        bots[name].reconnectAt = null;
         createBot(name);
       }
     }, delay);
@@ -642,11 +673,42 @@ function escHtml(s) {
 }
 
 // ---- STATUS BADGE ----
-function applyStatus(status) {
+let countdownInterval = null;
+
+function applyStatus(status, reconnectAt) {
   const label = document.getElementById("statusLabel");
-  const txt   = { online:"Online", offline:"Disconnected", reconnecting:"Reconnecting…", connecting:"Connecting…", stopped:"Stopped" };
+  const baseText = {
+    online:       "Online",
+    offline:      "Disconnected",
+    reconnecting: "Reconnecting",
+    connecting:   "Connecting…",
+    stopped:      "Stopped"
+  };
+
   label.className = "statusLabel " + status;
-  label.textContent = txt[status] ?? status;
+
+  if (status === "reconnecting" && reconnectAt) {
+    // Clear any existing countdown ticker
+    if (countdownInterval) clearInterval(countdownInterval);
+
+    const tick = () => {
+      const secsLeft = Math.max(0, Math.round((reconnectAt - Date.now()) / 1000));
+      if (secsLeft >= 60) {
+        const m = Math.floor(secsLeft / 60);
+        const s = secsLeft % 60;
+        label.textContent = \`Reconnecting in \${m}m \${s}s\`;
+      } else {
+        label.textContent = \`Reconnecting in \${secsLeft}s\`;
+      }
+      if (secsLeft <= 0) clearInterval(countdownInterval);
+    };
+
+    tick();
+    countdownInterval = setInterval(tick, 1000);
+  } else {
+    if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
+    label.textContent = baseText[status] ?? status;
+  }
 }
 
 // ---- REFRESH ----
@@ -666,7 +728,7 @@ async function refresh() {
     const info = data[currentBot];
     if (!info) return;
 
-    applyStatus(info.status);
+    applyStatus(info.status, info.reconnectAt);
 
     const consoleDiv = document.getElementById("console");
 
@@ -770,15 +832,14 @@ app.get("/debug", (req, res) => {
 });
 
 // ================= DATA =================
-// FIX: Return structured log objects + status for all bots.
-// The frontend builds the HTML — the server just sends data.
 
 app.get("/data", (req, res) => {
   const out = {};
   for (const name of Object.keys(BOT_CONFIGS)) {
     out[name] = {
-      status: getStatus(name),
-      logs:   logs[name] ?? [],
+      status:      getStatus(name),
+      logs:        logs[name] ?? [],
+      reconnectAt: bots[name]?.reconnectAt ?? null, // epoch ms when next attempt fires
     };
   }
   res.json(out);
