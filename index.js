@@ -6,897 +6,1005 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ================= BOT REGISTRY =================
-// Instead of 3 separate variables, use a map.
-// This makes adding/removing bots much easier and
-// removes all the repeated if/else chains.
+// ================= BOTS =================
 
-const BOT_CONFIGS = {
-  Deadmau5:   { password: "676769" },
-  Prince:     { password: "676769" },
-  Wemmbu_Alt: { password: "676769" },
-};
-
-// bots["Deadmau5"] = { instance, status, reconnectTimer, afkInterval, shouldReconnect }
-const bots = {};
+let deadBot = null;
+let princeBot = null;
+let wemmbuBot = null;
 
 // ================= LOGS =================
-// Store plain objects instead of raw HTML strings.
-// HTML is built on the client side — this keeps the
-// server lean and lets the frontend re-render without
-// a full page reload.
 
-const MAX_LOGS = 400;
-const logs = {
-  Deadmau5:   [],
-  Prince:     [],
-  Wemmbu_Alt: [],
-};
+let deadLogs = [];
+let princeLogs = [];
+let wemmbuLogs = [];
 
 // ================= TIME =================
 
 function timeNow() {
-  return new Date().toLocaleTimeString("en-IN", {
-    timeZone: "Asia/Kolkata",
-    hour12: false,
-  });
+
+  return new Date().toLocaleTimeString(
+    "en-IN",
+    {
+      timeZone: "Asia/Kolkata",
+      hour12: false
+    }
+  );
+
 }
 
 // ================= LOG PUSH =================
 
-function pushLog(botName, type, text) {
-  // type: "server" | "chat" | "join" | "leave" | "error" | "system"
-  if (!text || !text.trim()) return;
+function pushLog(arr, html) {
 
-  const arr = logs[botName];
-  if (!arr) return;
+  arr.push(html);
 
-  arr.push({ t: timeNow(), type, text: text.trim() });
+  if(arr.length > 400){
 
-  if (arr.length > MAX_LOGS) arr.shift();
+    arr.shift();
+
+  }
+
 }
 
-// ================= MC COLOR STRIP =================
-// Strips §-codes completely for log storage.
-// The client renders color using CSS classes based on
-// the log entry "type", keeping things clean.
-// If you want colored text, do the mapping client-side.
+// ================= MC COLORS =================
 
-function stripMcColors(text) {
-  if (!text) return "";
-  // Strip ANSI escape codes
+function mcColor(text) {
+
+  if(!text) return "";
+
   text = text.replace(/\x1B\[[0-9;]*m/g, "");
-  // Strip Minecraft §-color codes
-  text = text.replace(/§[0-9a-fk-or]/gi, "");
-  return text;
+
+  const colors = {
+
+    "0":"#000000",
+    "1":"#0000AA",
+    "2":"#00AA00",
+    "3":"#00AAAA",
+    "4":"#AA0000",
+    "5":"#AA00AA",
+    "6":"#FFAA00",
+    "7":"#AAAAAA",
+    "8":"#555555",
+    "9":"#5555FF",
+    "a":"#55FF55",
+    "b":"#55FFFF",
+    "c":"#FF5555",
+    "d":"#FF55FF",
+    "e":"#FFFF55",
+    "f":"#FFFFFF"
+
+  };
+
+  text = text.replace(
+    /§([0-9a-f])/gi,
+    (_, code) => {
+
+      return `
+      <span style="color:${
+        colors[
+          code.toLowerCase()
+        ] || "#fff"
+      }">
+      `;
+
+    }
+  );
+
+  return text + "</span>";
+
 }
 
-// ================= PARSE CHAT LINE =================
+// ================= ADD LOG =================
 
-function parseChatLine(botName, rawMsg) {
-  if (!rawMsg) return;
+function addLog(botName, msg) {
 
-  const msg = stripMcColors(rawMsg).trim();
-  if (!msg) return;
+  if(!msg) return;
 
-  // Detect <Player> message format
-  const chatMatch = msg.match(/^<([^>]+)>\s(.+)/);
-  if (chatMatch) {
-    pushLog(botName, "chat", `<${chatMatch[1]}> ${chatMatch[2]}`);
-    return;
+  msg = msg.trim();
+
+  if(!msg.length) return;
+
+  let sender = "SERVER";
+
+  let finalMsg = msg;
+
+  const normal =
+  msg.match(/^<([^>]+)>\s(.+)/);
+
+  if(normal){
+
+    sender = normal[1];
+
+    finalMsg = normal[2];
+
   }
 
-  // Detect error lines
-  if (msg.startsWith("ERROR:")) {
-    pushLog(botName, "error", msg);
-    return;
+  finalMsg = mcColor(finalMsg);
+
+  const html = `
+
+  <div class="line">
+
+    <span class="time">
+      [${timeNow()}]
+    </span>
+
+    <span class="sender">
+      [${sender}]
+    </span>
+
+    <span class="msg">
+      ${finalMsg}
+    </span>
+
+  </div>
+
+  `;
+
+  if(botName === "Deadmau5"){
+    pushLog(deadLogs, html);
   }
 
-  pushLog(botName, "server", msg);
+  if(botName === "Prince"){
+    pushLog(princeLogs, html);
+  }
+
+  if(botName === "Wemmbu_Alt"){
+    pushLog(wemmbuLogs, html);
+  }
+
 }
 
 // ================= ANTI AFK =================
-// FIX: Return the interval ID so it can be cleared
-// on disconnect, preventing a memory leak where the
-// old interval keeps firing after the bot is gone.
 
-function startAntiAfk(bot) {
-  return setInterval(() => {
-    try {
-      if (!bot || !bot.entity) return;
+function antiAfk(bot){
 
-      const yaw = Math.random() * Math.PI * 2;
-      const pitch = (Math.random() - 0.5) * 0.5;
+  setInterval(() => {
+
+    try{
+
+      if(!bot.entity) return;
+
+      const yaw =
+      Math.random() * Math.PI * 2;
+
+      const pitch =
+      (Math.random() - 0.5) * 0.5;
+
       bot.look(yaw, pitch, true);
 
       bot.setControlState("jump", true);
+
       setTimeout(() => {
-        try { bot.setControlState("jump", false); } catch {}
+
+        bot.setControlState(
+          "jump",
+          false
+        );
+
       }, 300);
-    } catch {}
+
+    }catch{}
+
   }, 30000);
-}
 
-// ================= BOT STATUS HELPERS =================
-
-function setStatus(botName, status) {
-  // status: "online" | "offline" | "reconnecting" | "connecting" | "stopped"
-  if (!bots[botName]) bots[botName] = {};
-  bots[botName].status = status;
-}
-
-function getStatus(botName) {
-  return bots[botName]?.status ?? "stopped";
 }
 
 // ================= CREATE BOT =================
-// FIX: Accept a "state" object so the reconnect loop
-// can check shouldReconnect before spawning a new bot.
-// This means clicking STOP truly stops reconnecting.
 
-function createBot(name) {
-  const config = BOT_CONFIGS[name];
-  if (!config) return null;
+function createBot(name, password){
 
-  // Clean up any lingering timer
-  if (bots[name]?.reconnectTimer) {
-    clearTimeout(bots[name].reconnectTimer);
-  }
+  addLog(
+    name,
+    "§eConnecting..."
+  );
 
-  // Initialise state if needed
-  if (!bots[name]) bots[name] = {};
-  bots[name].shouldReconnect = true;
-  // FIX: Don't reset reconnectDelay here — it's managed by the end/stable
-  // handlers so backoff accumulates correctly across reconnect cycles.
-  // Only initialise it if it has never been set.
-  if (!bots[name].reconnectDelay) {
-    bots[name].reconnectDelay = 60000;
-  }
+  const bot = mineflayer.createBot({
 
-  setStatus(name, "connecting");
-  pushLog(name, "system", "Connecting...");
+    host:"karmasmp.ddns.net",
 
-  const instance = mineflayer.createBot({
-    host: "karmasmp.ddns.net",
-    port: 25565,
-    username: name,
-    hideErrors: false,
-    // FIX: Many servers running 1.8-1.12 reject newer clients
-    // immediately (socketClosed within 2s). Setting version
-    // explicitly stops the version mismatch kick.
-    // Change "1.8.9" to match your server version if needed.
-    version: false, // false = let mineflayer auto-detect (safest default)
-    // Keep the TCP socket alive to detect drops faster
-    keepAlive: true,
+    port:25565,
+
+    username:name
+
   });
 
-  // FIX: Assign a unique generation ID to this bot instance.
-  // When "end" fires we check the ID matches — prevents a stale
-  // bot's event from triggering a reconnect for a newer instance.
-  const instanceId = Date.now();
-  instance._dashId = instanceId;
+  bot.online = false;
 
-  bots[name].instance = instance;
-  bots[name].instanceId = instanceId;
+  bot.once("spawn", () => {
 
-  // ---- SPAWN ----
-  instance.once("spawn", () => {
-    // Guard: ignore if this is a stale instance
-    if (bots[name]?.instanceId !== instanceId) return;
+    bot.online = true;
 
-    setStatus(name, "online");
-    pushLog(name, "system", "Connected");
-
-    // FIX: Only reset backoff after a STABLE connection.
-    // We wait 10s — if the server kicks us within 10s (socketClosed)
-    // the timer is cancelled in the "end" handler and backoff stays.
-    bots[name].stableTimer = setTimeout(() => {
-      if (bots[name]?.instanceId === instanceId) {
-        bots[name].reconnectDelay = 60000; // reset backoff: connection is stable
-        pushLog(name, "system", "Connection stable");
-      }
-    }, 10000);
+    addLog(
+      name,
+      "§aConnected"
+    );
 
     setTimeout(() => {
-      try {
-        if (bots[name]?.instanceId !== instanceId) return;
-        instance.chat("/login " + config.password);
-        pushLog(name, "system", "Executed /login");
-      } catch {}
+
+      bot.chat("/login " + password);
+
+      addLog(
+        name,
+        "§eExecuted /login"
+      );
+
     }, 3000);
 
-    // Start anti-AFK and store the interval ID
-    bots[name].afkInterval = startAntiAfk(instance);
+    antiAfk(bot);
+
   });
 
-  // ---- CHAT ----
-  instance.on("messagestr", (msg) => {
-    if (bots[name]?.instanceId !== instanceId) return;
-    parseChatLine(name, msg);
+  bot.on("messagestr", (msg) => {
 
-    // FIX: Some login plugins (AuthMe, nLogin) send a chat prompt instead of
-    // waiting for spawn. If we see "login" or "password" in a server message,
-    // re-send the login command immediately.
-    const stripped = stripMcColors(msg).toLowerCase();
-    if (
-      (stripped.includes("login") || stripped.includes("password")) &&
-      stripped.includes("/login") &&
-      getStatus(name) === "online"
-    ) {
-      try {
-        instance.chat("/login " + config.password);
-      } catch {}
-    }
+    addLog(name, msg);
+
   });
 
-  // ---- PLAYER JOIN/LEAVE ----
-  instance.on("playerJoined", (player) => {
-    pushLog(name, "join", `${player.username} joined the game`);
+;
+
+  bot.on("playerJoined", (player) => {
+
+    addLog(
+      name,
+      "§a" +
+      player.username +
+      " joined the game"
+    );
+
   });
 
-  instance.on("playerLeft", (player) => {
-    pushLog(name, "leave", `${player.username} left the game`);
+  bot.on("playerLeft", (player) => {
+
+    addLog(
+      name,
+      "§c" +
+      player.username +
+      " left the game"
+    );
+
   });
 
-  // ---- KICK ----
-  // Fired before "end" with the server's kick reason.
-  // We store the kick reason on the bot state so the "end"
-  // handler can choose the right reconnect delay for it.
-  instance.on("kicked", (reason) => {
-    if (bots[name]?.instanceId !== instanceId) return;
+  bot.on("end", () => {
 
-    let text = reason;
-    try {
-      // Server sends JSON — unwrap it to readable text
-      const parsed = JSON.parse(reason);
-      text = parsed?.text || parsed?.translate || parsed?.extra?.[0]?.text || reason;
-      // Strip surrounding quotes if the JSON value was a plain string
-      text = text.replace(/^"|"$/g, "").trim();
-    } catch { /* reason was already plain text */ }
+    bot.online = false;
 
-    pushLog(name, "error", `Kicked: ${text}`);
+    addLog(
+      name,
+      "§cDisconnected"
+    );
 
-    // Store normalised kick reason for the "end" handler below
-    bots[name]._lastKick = text.toLowerCase();
-  });
+    setTimeout(() => {
 
-  // ---- DISCONNECT ----
-  instance.on("end", (reason) => {
-    // Ignore events from stale bot instances (the "shuffle" bug)
-    if (bots[name]?.instanceId !== instanceId) return;
+      addLog(
+        name,
+        "§6Reconnecting..."
+      );
 
-    // Cancel the stable-connection timer
-    if (bots[name]?.stableTimer) {
-      clearTimeout(bots[name].stableTimer);
-      bots[name].stableTimer = null;
-    }
+      if(
+        name === "Deadmau5"
+        && deadBot
+      ){
 
-    setStatus(name, "offline");
-    pushLog(name, "system", "Disconnected");
+        deadBot =
+        createBot(
+          "Deadmau5",
+          "676769"
+        );
 
-    // Clear anti-AFK interval to prevent memory leak
-    if (bots[name]?.afkInterval) {
-      clearInterval(bots[name].afkInterval);
-      bots[name].afkInterval = null;
-    }
-
-    // Only reconnect if the user hasn't clicked STOP
-    if (!bots[name]?.shouldReconnect) {
-      pushLog(name, "system", "Stopped. Not reconnecting.");
-      return;
-    }
-
-    // ---- SMART DELAY BASED ON KICK REASON ----
-    // Read and clear the stored kick reason
-    const kick = bots[name]._lastKick ?? "";
-    bots[name]._lastKick = null;
-
-    let delay;
-
-    if (kick.includes("throttl") || kick.includes("too many") || kick.includes("too fast")) {
-      // "Connection throttled! Please wait before reconnecting."
-      // Server is rate-limiting us. Wait 5 minutes and reset backoff
-      // so we start fresh from 60s rather than doubling a huge number.
-      delay = 5 * 60 * 1000; // 5 minutes
-      bots[name].reconnectDelay = 60000; // reset backoff after throttle wait
-      pushLog(name, "system", "⚠ Throttled by server. Waiting 5 minutes...");
-
-    } else if (kick.includes("same username") || kick.includes("already playing") || kick.includes("already logged")) {
-      // "The same username is already playing on the server!"
-      // Our previous session is still alive on the server.
-      // Wait 3 minutes for the server to time it out, then reconnect.
-      delay = 3 * 60 * 1000; // 3 minutes
-      bots[name].reconnectDelay = 60000; // reset backoff after session wait
-      pushLog(name, "system", "⚠ Duplicate session on server. Waiting 3 minutes for it to expire...");
-
-    } else {
-      // Normal disconnect — use exponential backoff
-      delay = bots[name].reconnectDelay ?? 60000;
-      // Double for next time, cap at 5 minutes
-      bots[name].reconnectDelay = Math.min(delay * 2, 300000);
-    }
-
-    setStatus(name, "reconnecting");
-    const delaySec = Math.round(delay / 1000);
-    const delayLabel = delaySec >= 60 ? `${Math.round(delaySec / 60)}m` : `${delaySec}s`;
-    pushLog(name, "system", `Reconnecting in ${delayLabel}...`);
-
-    // Store the epoch time when the next attempt fires — used for countdown
-    bots[name].reconnectAt = Date.now() + delay;
-
-    bots[name].reconnectTimer = setTimeout(() => {
-      if (bots[name]?.shouldReconnect) {
-        bots[name].reconnectAt = null;
-        createBot(name);
       }
-    }, delay);
+
+      if(
+        name === "Prince"
+        && princeBot
+      ){
+
+        princeBot =
+        createBot(
+          "Prince",
+          "676769"
+        );
+
+      }
+
+      if(
+        name === "Wemmbu_Alt"
+        && wemmbuBot
+      ){
+
+        wemmbuBot =
+        createBot(
+          "Wemmbu_Alt",
+          "676769"
+        );
+
+      }
+
+    }, 60000);
+
   });
 
-  // ---- ERROR ----
-  instance.on("error", (err) => {
-    // Don't log ECONNRESET separately — it always triggers "end" too,
-    // which avoids duplicate error+disconnect messages in the console.
-    if (err.code === "ECONNRESET" || err.code === "ECONNREFUSED") return;
-    pushLog(name, "error", "ERROR: " + err.message);
+  bot.on("error", (err) => {
+
+    addLog(
+      name,
+      "§4ERROR: " + err.message
+    );
+
   });
 
-  return instance;
-}
+  return bot;
 
-// ================= STOP BOT =================
-// Extracted into a helper so both the /stop route
-// and internal cleanup use the same logic.
-
-function stopBot(name) {
-  const state = bots[name];
-  if (!state) return;
-
-  // Prevent reconnect loop
-  state.shouldReconnect = false;
-
-  // Clear all timers
-  if (state.reconnectTimer) {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
-  }
-  if (state.stableTimer) {
-    clearTimeout(state.stableTimer);
-    state.stableTimer = null;
-  }
-  if (state.afkInterval) {
-    clearInterval(state.afkInterval);
-    state.afkInterval = null;
-  }
-
-  // Invalidate instance ID so any in-flight events are ignored
-  state.instanceId = null;
-
-  // Disconnect the bot if it exists
-  if (state.instance) {
-    try { state.instance.quit(); } catch {}
-    state.instance = null;
-  }
-
-  setStatus(name, "stopped");
-  pushLog(name, "system", "Bot stopped.");
 }
 
 // ================= WEBSITE =================
 
 app.get("/", (req, res) => {
-  res.send(`<!DOCTYPE html>
+
+res.send(`
+
+<!DOCTYPE html>
+
 <html>
+
 <head>
+
 <title>Karma Bot Manager</title>
+
 <style>
 
-*, *::before, *::after { box-sizing: border-box; }
+body{
 
-body {
-  margin: 0;
-  height: 100vh;
-  display: flex;
-  font-family: Consolas, monospace;
-  color: white;
-  background: radial-gradient(circle at top left, #1e293b, #020617);
-  overflow: hidden;
+margin:0;
+
+height:100vh;
+
+display:flex;
+
+font-family:Consolas;
+
+color:white;
+
+background:
+radial-gradient(
+circle at top left,
+#1e293b,
+#020617
+);
+
+overflow:hidden;
+
 }
 
-/* ---- LEFT PANEL ---- */
-.left {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  padding: 12px;
-  min-width: 0;
+.left{
+flex:1;
+display:flex;
+flex-direction:column;
+padding:12px;
 }
 
-.tabs {
-  display: flex;
-  gap: 10px;
-  margin-bottom: 10px;
-  flex-wrap: wrap;
+.tabs{
+display:flex;
+gap:10px;
+margin-bottom:10px;
+flex-wrap:wrap;
 }
 
-.tab {
-  padding: 10px 16px;
-  background: #161b22;
-  border: none;
-  border-radius: 12px;
-  color: white;
-  cursor: pointer;
-  transition: .25s;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-family: Consolas, monospace;
-  font-size: 14px;
-}
-.tab:hover { transform: translateY(-2px); }
-.tab.active {
-  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
-  box-shadow: 0 0 18px #3b82f6;
-}
+.tab{
 
-/* Status dot on tab */
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #555;
-  flex-shrink: 0;
-}
-.dot.online    { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
-.dot.offline   { background: #ef4444; }
-.dot.reconnecting { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
-.dot.connecting   { background: #38bdf8; box-shadow: 0 0 6px #38bdf8; }
-.dot.stopped   { background: #555; }
+padding:10px 16px;
 
-/* ---- CONSOLE ---- */
-.console {
-  flex: 1;
-  background: rgba(255,255,255,.04);
-  backdrop-filter: blur(16px);
-  border: 1px solid rgba(255,255,255,.08);
-  border-radius: 18px;
-  padding: 12px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  font-size: 13px;
-  box-shadow: 0 0 35px rgba(59,130,246,.15);
-  transition: opacity .2s ease;
-  /* FIX: use content-visibility for better scroll performance */
-  contain: layout style;
+background:#161b22;
+
+border:none;
+
+border-radius:12px;
+
+color:white;
+
+cursor:pointer;
+
+transition:.25s;
+
+}
+.tab:hover{
+
+transform:
+translateY(-2px);
+
 }
 
-.line {
-  display: grid;
-  grid-template-columns: 80px 110px 1fr;
-  gap: 8px;
-  margin-bottom: 3px;
-  line-height: 1.5;
+.active{
+
+background:
+linear-gradient(
+135deg,
+#3b82f6,
+#8b5cf6
+);
+
+box-shadow:
+0 0 18px #3b82f6;
+
 }
 
-.time   { color: #4b5563; }
-.sender { font-weight: bold; }
+.console{
 
-/* Log type colours */
-.type-system { color: #94a3b8; }
-.type-chat   { color: #e2e8f0; }
-.type-join   { color: #22c55e; }
-.type-leave  { color: #f87171; }
-.type-error  { color: #f87171; font-weight: bold; }
-.type-server { color: #94a3b8; }
+flex:1;
 
-.sender-system { color: #4b5563; }
-.sender-chat   { color: #38bdf8; }
-.sender-join   { color: #22c55e; }
-.sender-leave  { color: #f87171; }
-.sender-error  { color: #f87171; }
-.sender-server { color: #4b5563; }
+background:
+rgba(255,255,255,.04);
 
-/* ---- INPUT BAR ---- */
-.inputBar {
-  display: flex;
-  gap: 10px;
-  margin-top: 10px;
+backdrop-filter:
+blur(16px);
+
+border:
+1px solid rgba(255,255,255,.08);
+
+border-radius:18px;
+
+padding:12px;
+
+overflow:auto;
+
+font-size:14px;
+
+box-shadow:
+0 0 35px
+rgba(59,130,246,.15);
+
+transition:
+opacity .2s ease;
+
 }
 
-.input {
-  flex: 1;
-  padding: 12px;
-  background: #111;
-  border: 1px solid #333;
-  border-radius: 10px;
-  color: white;
-  font-family: Consolas, monospace;
-}
-.input:focus { outline: none; border-color: #3b82f6; }
+.line{
 
-.send {
-  width: 100px;
-  border: none;
-  background: #2563eb;
-  color: white;
-  border-radius: 10px;
-  cursor: pointer;
-  font-family: Consolas, monospace;
-  font-weight: bold;
-  transition: .2s;
-}
-.send:hover { background: #3b82f6; transform: translateY(-1px); }
+display:grid;
 
-/* ---- RIGHT PANEL ---- */
-.right {
-  width: 320px;
-  background: #0d1117;
-  padding: 12px;
-  overflow: auto;
-  border-left: 1px solid #1e293b;
+grid-template-columns:
+90px 140px 1fr;
+
+gap:8px;
+
+margin-bottom:4px;
+
+align-items:start;
+
 }
 
-.panel {
-  background: rgba(255,255,255,.05);
-  backdrop-filter: blur(16px);
-  border: 1px solid rgba(255,255,255,.08);
-  border-radius: 18px;
-  padding: 16px;
-  margin-bottom: 12px;
-  box-shadow: 0 0 30px rgba(59,130,246,.12);
+.time{
+color:#666;
+min-width:90px;
 }
 
-.panel h2 {
-  margin: 0 0 4px 0;
-  font-size: 24px;
-  letter-spacing: 1px;
+.sender{
+color:#38bdf8;
+min-width:140px;
+font-weight:bold;
 }
 
-.statusLabel {
-  font-size: 12px;
-  padding: 3px 10px;
-  border-radius: 999px;
-  display: inline-block;
-  margin-bottom: 12px;
-  font-weight: bold;
-  text-transform: uppercase;
-}
-.statusLabel.online      { background: #14532d; color: #22c55e; }
-.statusLabel.offline     { background: #450a0a; color: #f87171; }
-.statusLabel.reconnecting{ background: #451a03; color: #f59e0b; }
-.statusLabel.connecting  { background: #0c2a3d; color: #38bdf8; }
-.statusLabel.stopped     { background: #1e293b; color: #64748b; }
-
-.btns {
-  display: flex;
-  gap: 10px;
+.msg{
+flex:1;
 }
 
-.small {
-  flex: 1;
-  padding: 12px;
-  border: none;
-  border-radius: 12px;
-  cursor: pointer;
-  color: white;
-  font-weight: bold;
-  font-family: Consolas, monospace;
-  transition: .2s;
+.inputBar{
+display:flex;
+gap:10px;
+margin-top:10px;
 }
-.small:hover { transform: translateY(-2px); }
-.green { background: #16a34a; }
-.green:hover { background: #22c55e; }
-.red   { background: #dc2626; }
-.red:hover { background: #ef4444; }
 
-/* Scrollbar styling */
-.console::-webkit-scrollbar { width: 6px; }
-.console::-webkit-scrollbar-track { background: transparent; }
-.console::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+.input{
+flex:1;
+padding:12px;
+background:#111;
+border:1px solid #333;
+border-radius:10px;
+color:white;
+}
+
+.send{
+width:120px;
+border:none;
+background:#2563eb;
+color:white;
+border-radius:10px;
+cursor:pointer;
+}
+
+.right{
+width:380px;
+background:#111;
+padding:12px;
+overflow:auto;
+border-left:1px solid #222;
+}
+
+.panel{
+
+background:
+rgba(255,255,255,.05);
+
+backdrop-filter:
+blur(16px);
+
+border:
+1px solid rgba(255,255,255,.08);
+
+border-radius:18px;
+
+padding:14px;
+
+margin-bottom:12px;
+
+box-shadow:
+0 0 30px
+rgba(59,130,246,.12);
+
+}
+
+.btns{
+display:flex;
+gap:10px;
+margin-top:10px;
+}
+
+.small{
+
+flex:1;
+
+padding:12px;
+
+border:none;
+
+border-radius:12px;
+
+cursor:pointer;
+
+color:white;
+
+font-weight:bold;
+
+transition:.2s;
+
+}
+.small:hover{
+
+transform:
+translateY(-2px);
+
+}
+
+.green{
+background:#16a34a;
+}
+
+.red{
+background:#dc2626;
+}
+
+.player{
+background:#0d1117;
+padding:6px 10px;
+border-radius:999px;
+margin:4px;
+display:inline-block;
+font-size:12px;
+}
 
 </style>
+
 </head>
+
 <body>
 
 <div class="left">
 
-  <div class="tabs">
-    <button id="DeadmauTab"   class="tab active" onclick="switchBot('Deadmau5')">
-      <span class="dot" id="dot-Deadmau5"></span>Deadmau5
-    </button>
-    <button id="PrinceTab"    class="tab"        onclick="switchBot('Prince')">
-      <span class="dot" id="dot-Prince"></span>Prince
-    </button>
-    <button id="Wemmbu_AltTab" class="tab"       onclick="switchBot('Wemmbu_Alt')">
-      <span class="dot" id="dot-Wemmbu_Alt"></span>Wemmbu_Alt
-    </button>
-  </div>
+<div class="tabs">
 
-  <div class="console" id="console"></div>
+<button id="Deadmau5Tab" class="tab active" onclick="switchBot('Deadmau5')">Deadmau5</button>
 
-  <div class="inputBar">
-    <input id="cmd" class="input" placeholder="Send message or /command">
-    <button class="send" onclick="sendMsg()">SEND</button>
-  </div>
+<button id="PrinceTab" class="tab" onclick="switchBot('Prince')">Prince</button>
+
+<button id="Wemmbu_AltTab" class="tab" onclick="switchBot('Wemmbu_Alt')">Wemmbu_Alt</button>
+
+</div>
+
+<div class="console" id="console"></div>
+
+<div class="inputBar">
+
+<input
+id="cmd"
+class="input"
+placeholder="Send message">
+
+<button
+class="send"
+onclick="sendMsg()">
+SEND
+</button>
+
+</div>
 
 </div>
 
 <div class="right">
-  <div class="panel">
-    <h2 id="activeName">Deadmau5</h2>
-    <span class="statusLabel stopped" id="statusLabel">Stopped</span>
-    <div class="btns">
-      <button class="small green" onclick="startBot()">START</button>
-      <button class="small red"   onclick="stopBot()">STOP</button>
-    </div>
-  </div>
+
+<div class="panel">
+
+<h2
+id="activeName"
+style="
+margin-top:0;
+font-size:28px;
+letter-spacing:1px;
+">
+Deadmau5
+</h2>
+
+<div class="btns">
+
+<button
+class="small green"
+onclick="startBot()">
+START
+</button>
+
+<button
+class="small red"
+onclick="stopBot()">
+STOP
+</button>
+
+</div>
+
+</div>
+
 </div>
 
 <script>
 
 let currentBot = "Deadmau5";
-// FIX: Track last log count to skip full re-render when nothing changed
-let lastLogCount = {};
 
-// ---- SENDER LABEL BY TYPE ----
-const senderLabel = {
-  system:      "SYSTEM",
-  server:      "SERVER",
-  chat:        null,   // extracted from message
-  join:        "JOIN",
-  leave:       "LEAVE",
-  error:       "ERROR",
-};
+function switchBot(name){
 
-// ---- RENDER A LOG ENTRY TO HTML ----
-function renderLine(entry) {
-  let sender = senderLabel[entry.type] ?? "SERVER";
-  let text    = entry.text;
+currentBot = name;
 
-  // For chat lines, extract <PlayerName> as the sender
-  if (entry.type === "chat") {
-    const m = text.match(/^<([^>]+)>\\s?(.+)/);
-    if (m) { sender = m[1]; text = m[2]; }
-  }
+document
+.getElementById("activeName")
+.innerText = name;
 
-  return \`<div class="line">
-    <span class="time">\${entry.t}</span>
-    <span class="sender sender-\${entry.type}">\${escHtml(sender)}</span>
-    <span class="msg type-\${entry.type}">\${escHtml(text)}</span>
-  </div>\`;
+document.querySelectorAll(".tab")
+.forEach(e=>e.classList.remove("active"));
+
+document
+.getElementById(name + "Tab")
+.classList.add("active");
+
+const consoleDiv =
+document.getElementById("console");
+
+consoleDiv.style.opacity = 0;
+
+setTimeout(()=>{
+
+refresh();
+
+consoleDiv.style.opacity = 1;
+
+},150);
+
 }
 
-function escHtml(s) {
-  return String(s)
-    .replace(/&/g,"&amp;")
-    .replace(/</g,"&lt;")
-    .replace(/>/g,"&gt;");
+async function refresh(){
+
+const res =
+await fetch("/data");
+
+const data =
+await res.json();
+
+let bot;
+
+if(currentBot === "Deadmau5"){
+
+bot = data.dead;
+
+}else if(currentBot === "Prince"){
+
+bot = data.prince;
+
+}else{
+
+bot = data.wemmbu;
+
 }
 
-// ---- STATUS BADGE ----
-let countdownInterval = null;
+document
+.getElementById("console")
+.innerHTML =
+bot.logs.join("");
 
-function applyStatus(status, reconnectAt) {
-  const label = document.getElementById("statusLabel");
-  const baseText = {
-    online:       "Online",
-    offline:      "Disconnected",
-    reconnecting: "Reconnecting",
-    connecting:   "Connecting…",
-    stopped:      "Stopped"
-  };
+const consoleDiv =
+document.getElementById("console");
 
-  label.className = "statusLabel " + status;
+const nearBottom =
+consoleDiv.scrollHeight -
+consoleDiv.scrollTop -
+consoleDiv.clientHeight
+< 100;
 
-  if (status === "reconnecting" && reconnectAt) {
-    // Clear any existing countdown ticker
-    if (countdownInterval) clearInterval(countdownInterval);
+if(nearBottom){
 
-    const tick = () => {
-      const secsLeft = Math.max(0, Math.round((reconnectAt - Date.now()) / 1000));
-      if (secsLeft >= 60) {
-        const m = Math.floor(secsLeft / 60);
-        const s = secsLeft % 60;
-        label.textContent = \`Reconnecting in \${m}m \${s}s\`;
-      } else {
-        label.textContent = \`Reconnecting in \${secsLeft}s\`;
-      }
-      if (secsLeft <= 0) clearInterval(countdownInterval);
-    };
+consoleDiv.scrollTop =
+consoleDiv.scrollHeight;
 
-    tick();
-    countdownInterval = setInterval(tick, 1000);
-  } else {
-    if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
-    label.textContent = baseText[status] ?? status;
-  }
 }
 
-// ---- REFRESH ----
-async function refresh() {
-  try {
-    const res  = await fetch("/data");
-    const data = await res.json();
-
-    // Update all status dots
-    for (const [name, info] of Object.entries(data)) {
-      const dot = document.getElementById("dot-" + name);
-      if (dot) {
-        dot.className = "dot " + info.status;
-      }
-    }
-
-    const info = data[currentBot];
-    if (!info) return;
-
-    applyStatus(info.status, info.reconnectAt);
-
-    const consoleDiv = document.getElementById("console");
-
-    // FIX: Only re-render if log count changed
-    if ((lastLogCount[currentBot] ?? -1) === info.logs.length) return;
-    lastLogCount[currentBot] = info.logs.length;
-
-    const nearBottom =
-      consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight < 80;
-
-    consoleDiv.innerHTML = info.logs.map(renderLine).join("");
-
-    if (nearBottom) {
-      consoleDiv.scrollTop = consoleDiv.scrollHeight;
-    }
-  } catch {}
 }
 
-// ---- SWITCH BOT ----
-function switchBot(name) {
-  currentBot = name;
-  document.getElementById("activeName").textContent = name;
-  document.querySelectorAll(".tab").forEach(e => e.classList.remove("active"));
+async function sendMsg(){
 
-  // Map name to tab ID
-  const tabMap = { Deadmau5: "DeadmauTab", Prince: "PrinceTab", Wemmbu_Alt: "Wemmbu_AltTab" };
-  document.getElementById(tabMap[name])?.classList.add("active");
+const msg =
+document.getElementById("cmd").value;
 
-  const consoleDiv = document.getElementById("console");
-  consoleDiv.style.opacity = 0;
-  lastLogCount[name] = -1; // force re-render
-  setTimeout(() => {
-    refresh();
-    consoleDiv.style.opacity = 1;
-  }, 150);
-}
+if(!msg) return;
 
-// ---- SEND ----
-async function sendMsg() {
-  const msg = document.getElementById("cmd").value.trim();
-  if (!msg) return;
+await fetch("/send",{
 
-  await fetch("/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bot: currentBot, msg }),
-  });
+method:"POST",
 
-  document.getElementById("cmd").value = "";
-}
+headers:{
+"Content-Type":"application/json"
+},
 
-// ---- START / STOP ----
-async function startBot() {
-  await fetch("/start", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bot: currentBot }),
-  });
-}
+body:JSON.stringify({
+bot:currentBot,
+msg:msg
+})
 
-async function stopBot() {
-  await fetch("/stop", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bot: currentBot }),
-  });
-}
-
-// ---- ENTER KEY ----
-document.getElementById("cmd").addEventListener("keypress", e => {
-  if (e.key === "Enter") sendMsg();
 });
 
-// ---- POLL ----
+document
+.getElementById("cmd")
+.value = "";
+
+}
+
+async function startBot(){
+
+await fetch("/start",{
+
+method:"POST",
+
+headers:{
+"Content-Type":"application/json"
+},
+
+body:JSON.stringify({
+bot:currentBot
+})
+
+});
+
+}
+
+async function stopBot(){
+
+await fetch("/stop",{
+
+method:"POST",
+
+headers:{
+"Content-Type":"application/json"
+},
+
+body:JSON.stringify({
+bot:currentBot
+})
+
+});
+
+}
+
+document
+.getElementById("cmd")
+.addEventListener(
+"keypress",
+e=>{
+
+if(e.key === "Enter"){
+
+sendMsg();
+
+}
+
+});
+
 setInterval(refresh, 1000);
+
 refresh();
 
 </script>
+
 </body>
-</html>`);
-});
 
-// ================= DEBUG =================
-// Visit /debug in your browser to see raw bot state.
-// Useful for diagnosing version mismatches and timer state.
+</html>
 
-app.get("/debug", (req, res) => {
-  const out = {};
-  for (const name of Object.keys(BOT_CONFIGS)) {
-    const state = bots[name] ?? {};
-    out[name] = {
-      status:         state.status,
-      instanceId:     state.instanceId,
-      shouldReconnect:state.shouldReconnect,
-      reconnectDelay: state.reconnectDelay,
-      hasInstance:    !!state.instance,
-      version:        state.instance?._client?.version ?? null,
-    };
-  }
-  res.json(out);
+`);
+
 });
 
 // ================= DATA =================
 
 app.get("/data", (req, res) => {
-  const out = {};
-  for (const name of Object.keys(BOT_CONFIGS)) {
-    out[name] = {
-      status:      getStatus(name),
-      logs:        logs[name] ?? [],
-      reconnectAt: bots[name]?.reconnectAt ?? null, // epoch ms when next attempt fires
-    };
-  }
-  res.json(out);
+
+  res.json({
+
+    dead:{
+      logs:deadLogs
+    },
+
+    prince:{
+      logs:princeLogs
+    },
+
+    wemmbu:{
+      logs:wemmbuLogs
+    }
+
+  });
+
 });
 
 // ================= SEND =================
 
 app.post("/send", (req, res) => {
-  const { bot: name, msg } = req.body;
-  if (!name || !msg) return res.sendStatus(400);
 
-  const instance = bots[name]?.instance;
-  if (!instance || getStatus(name) !== "online") return res.sendStatus(404);
+  const botName = req.body.bot;
+  const msg = req.body.msg;
 
-  try {
-    instance.chat(msg.toString());
-    pushLog(name, "chat", `<YOU> ${msg}`);
-    res.sendStatus(200);
-  } catch {
-    res.sendStatus(500);
+  let bot = null;
+
+  if(botName === "Deadmau5"){
+    bot = deadBot;
   }
+
+  if(botName === "Prince"){
+    bot = princeBot;
+  }
+
+  if(botName === "Wemmbu_Alt"){
+    bot = wemmbuBot;
+  }
+
+  if(!bot){
+    return res.sendStatus(404);
+  }
+
+  try{
+
+    bot.chat(msg.toString());
+
+    addLog(
+      botName,
+      "§b[YOU] " + msg
+    );
+
+    res.sendStatus(200);
+
+  }catch{
+
+    res.sendStatus(500);
+
+  }
+
 });
 
 // ================= START =================
 
 app.post("/start", (req, res) => {
-  const name = req.body.bot;
-  if (!BOT_CONFIGS[name]) return res.sendStatus(400);
 
-  const status = getStatus(name);
+  const bot = req.body.bot;
 
-  // Don't double-start
-  if (status === "online" || status === "connecting") {
-    return res.sendStatus(200);
+  if(bot === "Deadmau5" && !deadBot){
+
+    deadBot =
+    createBot(
+      "Deadmau5",
+      "676769"
+    );
+
   }
 
-  createBot(name);
+  if(bot === "Prince" && !princeBot){
+
+    princeBot =
+    createBot(
+      "Prince",
+      "676769"
+    );
+
+  }
+
+  if(bot === "Wemmbu_Alt" && !wemmbuBot){
+
+    wemmbuBot =
+    createBot(
+      "Wemmbu_Alt",
+      "676769"
+    );
+
+  }
+
   res.sendStatus(200);
+
 });
 
 // ================= STOP =================
 
 app.post("/stop", (req, res) => {
-  const name = req.body.bot;
-  if (!BOT_CONFIGS[name]) return res.sendStatus(400);
-  stopBot(name);
+
+  const bot = req.body.bot;
+
+  if(bot === "Deadmau5" && deadBot){
+
+    deadBot.quit();
+
+    deadBot = null;
+
+  }
+
+  if(bot === "Prince" && princeBot){
+
+    princeBot.quit();
+
+    princeBot = null;
+
+  }
+
+  if(bot === "Wemmbu_Alt" && wemmbuBot){
+
+    wemmbuBot.quit();
+
+    wemmbuBot = null;
+
+  }
+
   res.sendStatus(200);
+
 });
 
 // ================= AUTO START =================
 
-for (const name of Object.keys(BOT_CONFIGS)) {
-  createBot(name);
-}
+deadBot =
+createBot(
+  "Deadmau5",
+  "676769"
+);
+
+princeBot =
+createBot(
+  "Prince",
+  "676769"
+);
+
+wemmbuBot =
+createBot(
+  "Wemmbu_Alt",
+  "676769"
+);
 
 // ================= SERVER =================
 
-app.listen(3000, "0.0.0.0", () => {
-  console.log("Dashboard running on port 3000");
+app.listen(
+3000,
+"0.0.0.0",
+()=>{
+
+console.log(
+"Dashboard running"
+);
+
 });
