@@ -258,11 +258,15 @@ function stopBot(name) {
 
   if (s.inst) {
     try { s.inst.quit(); } catch {}
+    try {
+      const socket = s.inst && s.inst._client && s.inst._client.socket;
+      if (socket && !socket.destroyed) socket.destroy();
+    } catch {}
     s.inst = null;
   }
 
   s.status      = "stopped";
-  s.reconnDelay = 60000; // reset backoff for next manual start
+  s.reconnDelay = 60000;
   addLog(name, "system", "Bot stopped.");
 }
 
