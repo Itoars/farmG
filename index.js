@@ -2,916 +2,718 @@ const express = require("express");
 const mineflayer = require("mineflayer");
 
 const app = express();
-
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// ================= BOT REGISTRY =================
-// Instead of 3 separate variables, use a map.
-// This makes adding/removing bots much easier and
-// removes all the repeated if/else chains.
+// ─────────────────────────────────────────
+//  CONFIG
+// ─────────────────────────────────────────
 
-const BOT_CONFIGS = {
-  Deadmau5:   { password: "676769" },
-  Prince:     { password: "676769" },
-  Wemmbu_Alt: { password: "676769" },
-};
+const SERVER_HOST = "karmasmp.ddns.net";
+const SERVER_PORT = 25565;
 
-// bots["Deadmau5"] = { instance, status, reconnectTimer, afkInterval, shouldReconnect }
-const bots = {};
+const BOT_LIST = [
+  { name: "Deadmau5",   password: "676769" },
+  { name: "Prince",     password: "676769" },
+  { name: "Wemmbu_Alt", password: "676769" },
+];
 
-// ================= LOGS =================
-// Store plain objects instead of raw HTML strings.
-// HTML is built on the client side — this keeps the
-// server lean and lets the frontend re-render without
-// a full page reload.
+// ─────────────────────────────────────────
+//  STATE
+// ─────────────────────────────────────────
 
-const MAX_LOGS = 400;
-const logs = {
-  Deadmau5:   [],
-  Prince:     [],
-  Wemmbu_Alt: [],
-};
+// bots["Deadmau5"] = { inst, status, logs[], reconnTimer, afkTimer, reconnDelay, reconnAt, gen }
+const state = {};
 
-// ================= TIME =================
-
-function timeNow() {
-  return new Date().toLocaleTimeString("en-IN", {
-    timeZone: "Asia/Kolkata",
-    hour12: false,
-  });
+for (const cfg of BOT_LIST) {
+  state[cfg.name] = {
+    inst:        null,
+    status:      "stopped",   // stopped | connecting | online | offline | reconnecting
+    logs:        [],
+    reconnTimer: null,
+    afkTimer:    null,
+    reconnDelay: 60000,
+    reconnAt:    null,
+    gen:         0,           // generation counter — stale event guard
+  };
 }
 
-// ================= LOG PUSH =================
+// ─────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────
 
-function pushLog(botName, type, text) {
-  // type: "server" | "chat" | "join" | "leave" | "error" | "system"
+function ts() {
+  return new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+}
+
+function addLog(name, type, text) {
   if (!text || !text.trim()) return;
-
-  const arr = logs[botName];
-  if (!arr) return;
-
-  arr.push({ t: timeNow(), type, text: text.trim() });
-
-  if (arr.length > MAX_LOGS) arr.shift();
+  const s = state[name];
+  if (!s) return;
+  s.logs.push({ t: ts(), type, text: text.trim() });
+  if (s.logs.length > 300) s.logs.shift();
 }
 
-// ================= MC COLOR STRIP =================
-// Strips §-codes completely for log storage.
-// The client renders color using CSS classes based on
-// the log entry "type", keeping things clean.
-// If you want colored text, do the mapping client-side.
-
-function stripMcColors(text) {
-  if (!text) return "";
-  // Strip ANSI escape codes
-  text = text.replace(/\x1B\[[0-9;]*m/g, "");
-  // Strip Minecraft §-color codes
-  text = text.replace(/§[0-9a-fk-or]/gi, "");
-  return text;
+// Strip §-codes and ANSI from Minecraft messages
+function strip(msg) {
+  return (msg || "")
+    .replace(/\x1B\[[0-9;]*m/g, "")
+    .replace(/§[0-9a-fk-or]/gi, "")
+    .trim();
 }
 
-// ================= PARSE CHAT LINE =================
-
-function parseChatLine(botName, rawMsg) {
-  if (!rawMsg) return;
-
-  const msg = stripMcColors(rawMsg).trim();
-  if (!msg) return;
-
-  // Detect <Player> message format
-  const chatMatch = msg.match(/^<([^>]+)>\s(.+)/);
-  if (chatMatch) {
-    pushLog(botName, "chat", `<${chatMatch[1]}> ${chatMatch[2]}`);
-    return;
+function stopAfk(name) {
+  if (state[name].afkTimer) {
+    clearInterval(state[name].afkTimer);
+    state[name].afkTimer = null;
   }
-
-  // Detect error lines
-  if (msg.startsWith("ERROR:")) {
-    pushLog(botName, "error", msg);
-    return;
-  }
-
-  pushLog(botName, "server", msg);
 }
 
-// ================= ANTI AFK =================
-// FIX: Return the interval ID so it can be cleared
-// on disconnect, preventing a memory leak where the
-// old interval keeps firing after the bot is gone.
-
-function startAntiAfk(bot) {
-  return setInterval(() => {
+function startAfk(name, inst) {
+  stopAfk(name);
+  state[name].afkTimer = setInterval(() => {
     try {
-      if (!bot || !bot.entity) return;
-
-      const yaw = Math.random() * Math.PI * 2;
-      const pitch = (Math.random() - 0.5) * 0.5;
-      bot.look(yaw, pitch, true);
-
-      bot.setControlState("jump", true);
-      setTimeout(() => {
-        try { bot.setControlState("jump", false); } catch {}
-      }, 300);
+      if (!inst.entity) return;
+      inst.look(Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.5, true);
+      inst.setControlState("jump", true);
+      setTimeout(() => { try { inst.setControlState("jump", false); } catch {} }, 300);
     } catch {}
   }, 30000);
 }
 
-// ================= BOT STATUS HELPERS =================
-
-function setStatus(botName, status) {
-  // status: "online" | "offline" | "reconnecting" | "connecting" | "stopped"
-  if (!bots[botName]) bots[botName] = {};
-  bots[botName].status = status;
+function cancelReconn(name) {
+  if (state[name].reconnTimer) {
+    clearTimeout(state[name].reconnTimer);
+    state[name].reconnTimer = null;
+  }
+  state[name].reconnAt = null;
 }
 
-function getStatus(botName) {
-  return bots[botName]?.status ?? "stopped";
-}
-
-// ================= CREATE BOT =================
-// FIX: Accept a "state" object so the reconnect loop
-// can check shouldReconnect before spawning a new bot.
-// This means clicking STOP truly stops reconnecting.
+// ─────────────────────────────────────────
+//  CREATE BOT
+// ─────────────────────────────────────────
 
 function createBot(name) {
-  const config = BOT_CONFIGS[name];
-  if (!config) return null;
+  const cfg = BOT_LIST.find(b => b.name === name);
+  if (!cfg) return;
 
-  // Clean up any lingering timer
-  if (bots[name]?.reconnectTimer) {
-    clearTimeout(bots[name].reconnectTimer);
+  const s = state[name];
+
+  // Kill any existing instance cleanly
+  if (s.inst) {
+    try { s.inst.quit(); } catch {}
+    s.inst = null;
   }
+  stopAfk(name);
+  cancelReconn(name);
 
-  // Initialise state if needed
-  if (!bots[name]) bots[name] = {};
-  bots[name].shouldReconnect = true;
-  // FIX: Don't reset reconnectDelay here — it's managed by the end/stable
-  // handlers so backoff accumulates correctly across reconnect cycles.
-  // Only initialise it if it has never been set.
-  if (!bots[name].reconnectDelay) {
-    bots[name].reconnectDelay = 60000;
-  }
+  // Bump generation — any event from a previous instance is ignored
+  s.gen += 1;
+  const myGen = s.gen;
 
-  setStatus(name, "connecting");
-  pushLog(name, "system", "Connecting...");
+  s.status = "connecting";
+  addLog(name, "system", "Connecting...");
 
-  const instance = mineflayer.createBot({
-    host: "karmasmp.ddns.net",
-    port: 25565,
-    username: name,
-    hideErrors: false,
-    // FIX: Many servers running 1.8-1.12 reject newer clients
-    // immediately (socketClosed within 2s). Setting version
-    // explicitly stops the version mismatch kick.
-    // Change "1.8.9" to match your server version if needed.
-    version: false, // false = let mineflayer auto-detect (safest default)
-    // Keep the TCP socket alive to detect drops faster
-    keepAlive: true,
+  const inst = mineflayer.createBot({
+    host:      SERVER_HOST,
+    port:      SERVER_PORT,
+    username:  name,
+    hideErrors: true,
   });
 
-  // FIX: Assign a unique generation ID to this bot instance.
-  // When "end" fires we check the ID matches — prevents a stale
-  // bot's event from triggering a reconnect for a newer instance.
-  const instanceId = Date.now();
-  instance._dashId = instanceId;
+  s.inst = inst;
 
-  bots[name].instance = instance;
-  bots[name].instanceId = instanceId;
+  // ── SPAWN ──────────────────────────────
+  inst.once("spawn", () => {
+    if (s.gen !== myGen) return;
 
-  // ---- SPAWN ----
-  instance.once("spawn", () => {
-    // Guard: ignore if this is a stale instance
-    if (bots[name]?.instanceId !== instanceId) return;
+    s.status = "online";
+    s.reconnDelay = 60000; // reset backoff on successful connect
+    addLog(name, "system", "Connected ✓");
 
-    setStatus(name, "online");
-    pushLog(name, "system", "Connected");
-
-    // FIX: Only reset backoff after a STABLE connection.
-    // We wait 10s — if the server kicks us within 10s (socketClosed)
-    // the timer is cancelled in the "end" handler and backoff stays.
-    bots[name].stableTimer = setTimeout(() => {
-      if (bots[name]?.instanceId === instanceId) {
-        bots[name].reconnectDelay = 60000; // reset backoff: connection is stable
-        pushLog(name, "system", "Connection stable");
-      }
-    }, 10000);
-
+    // Login after 2 s
     setTimeout(() => {
+      if (s.gen !== myGen) return;
       try {
-        if (bots[name]?.instanceId !== instanceId) return;
-        instance.chat("/login " + config.password);
-        pushLog(name, "system", "Executed /login");
+        inst.chat("/login " + cfg.password);
+        addLog(name, "system", "Sent /login");
       } catch {}
-    }, 3000);
+    }, 2000);
 
-    // Start anti-AFK and store the interval ID
-    bots[name].afkInterval = startAntiAfk(instance);
+    startAfk(name, inst);
   });
 
-  // ---- CHAT ----
-  instance.on("messagestr", (msg) => {
-    if (bots[name]?.instanceId !== instanceId) return;
-    parseChatLine(name, msg);
+  // ── CHAT ───────────────────────────────
+  inst.on("messagestr", (msg) => {
+    if (s.gen !== myGen) return;
+    const clean = strip(msg);
+    if (!clean) return;
 
-    // FIX: Some login plugins (AuthMe, nLogin) send a chat prompt instead of
-    // waiting for spawn. If we see "login" or "password" in a server message,
-    // re-send the login command immediately.
-    const stripped = stripMcColors(msg).toLowerCase();
-    if (
-      (stripped.includes("login") || stripped.includes("password")) &&
-      stripped.includes("/login") &&
-      getStatus(name) === "online"
-    ) {
-      try {
-        instance.chat("/login " + config.password);
-      } catch {}
+    // Determine log type
+    const chatMatch = clean.match(/^<([^>]+)>\s?(.+)/);
+    if (chatMatch) {
+      addLog(name, "chat", clean);
+    } else {
+      addLog(name, "server", clean);
     }
   });
 
-  // ---- PLAYER JOIN/LEAVE ----
-  instance.on("playerJoined", (player) => {
-    pushLog(name, "join", `${player.username} joined the game`);
+  // ── JOIN / LEAVE ───────────────────────
+  inst.on("playerJoined", (p) => {
+    if (s.gen !== myGen) return;
+    addLog(name, "join", p.username + " joined");
   });
 
-  instance.on("playerLeft", (player) => {
-    pushLog(name, "leave", `${player.username} left the game`);
+  inst.on("playerLeft", (p) => {
+    if (s.gen !== myGen) return;
+    addLog(name, "leave", p.username + " left");
   });
 
-  // ---- KICK ----
-  // Fired before "end" with the server's kick reason.
-  // We store the kick reason on the bot state so the "end"
-  // handler can choose the right reconnect delay for it.
-  instance.on("kicked", (reason) => {
-    if (bots[name]?.instanceId !== instanceId) return;
-
-    let text = reason;
+  // ── KICKED ─────────────────────────────
+  inst.on("kicked", (reason) => {
+    if (s.gen !== myGen) return;
+    let msg = reason;
     try {
-      // Server sends JSON — unwrap it to readable text
-      const parsed = JSON.parse(reason);
-      text = parsed?.text || parsed?.translate || parsed?.extra?.[0]?.text || reason;
-      // Strip surrounding quotes if the JSON value was a plain string
-      text = text.replace(/^"|"$/g, "").trim();
-    } catch { /* reason was already plain text */ }
+      const j = JSON.parse(reason);
+      msg = j.text || j.translate || JSON.stringify(j);
+    } catch {}
+    msg = strip(msg).replace(/^"|"$/g, "");
+    addLog(name, "error", "Kicked: " + msg);
 
-    pushLog(name, "error", `Kicked: ${text}`);
-
-    // Store normalised kick reason for the "end" handler below
-    bots[name]._lastKick = text.toLowerCase();
+    // Store kick reason for the "end" handler
+    s._kickReason = msg.toLowerCase();
   });
 
-  // ---- DISCONNECT ----
-  instance.on("end", (reason) => {
-    // Ignore events from stale bot instances (the "shuffle" bug)
-    if (bots[name]?.instanceId !== instanceId) return;
+  // ── ERROR ──────────────────────────────
+  inst.on("error", (err) => {
+    if (s.gen !== myGen) return;
+    // ECONNRESET always triggers "end" too — skip to avoid double messages
+    if (err.code === "ECONNRESET" || err.code === "ECONNREFUSED") return;
+    addLog(name, "error", "Error: " + err.message);
+  });
 
-    // Cancel the stable-connection timer
-    if (bots[name]?.stableTimer) {
-      clearTimeout(bots[name].stableTimer);
-      bots[name].stableTimer = null;
-    }
+  // ── END (disconnect) ───────────────────
+  inst.on("end", () => {
+    if (s.gen !== myGen) return;
 
-    setStatus(name, "offline");
-    pushLog(name, "system", "Disconnected");
+    stopAfk(name);
+    s.status = "offline";
+    addLog(name, "system", "Disconnected");
 
-    // Clear anti-AFK interval to prevent memory leak
-    if (bots[name]?.afkInterval) {
-      clearInterval(bots[name].afkInterval);
-      bots[name].afkInterval = null;
-    }
-
-    // Only reconnect if the user hasn't clicked STOP
-    if (!bots[name]?.shouldReconnect) {
-      pushLog(name, "system", "Stopped. Not reconnecting.");
+    // Don't reconnect if user clicked STOP
+    if (s._stopped) {
+      addLog(name, "system", "Not reconnecting (stopped).");
+      s._kickReason = null;
       return;
     }
 
-    // ---- SMART DELAY BASED ON KICK REASON ----
-    // Read and clear the stored kick reason
-    const kick = bots[name]._lastKick ?? "";
-    bots[name]._lastKick = null;
+    // Pick delay based on kick reason
+    const kick = s._kickReason || "";
+    s._kickReason = null;
 
     let delay;
 
     if (kick.includes("throttl") || kick.includes("too many") || kick.includes("too fast")) {
-      // "Connection throttled! Please wait before reconnecting."
-      // Server is rate-limiting us. Wait 5 minutes and reset backoff
-      // so we start fresh from 60s rather than doubling a huge number.
-      delay = 5 * 60 * 1000; // 5 minutes
-      bots[name].reconnectDelay = 60000; // reset backoff after throttle wait
-      pushLog(name, "system", "⚠ Throttled by server. Waiting 5 minutes...");
-
+      delay = 5 * 60 * 1000; // 5 min — server rate-limited us
+      s.reconnDelay = 60000;  // reset backoff after waiting
+      addLog(name, "system", "Throttled — waiting 5 min");
     } else if (kick.includes("same username") || kick.includes("already playing") || kick.includes("already logged")) {
-      // "The same username is already playing on the server!"
-      // Our previous session is still alive on the server.
-      // Wait 3 minutes for the server to time it out, then reconnect.
-      delay = 3 * 60 * 1000; // 3 minutes
-      bots[name].reconnectDelay = 60000; // reset backoff after session wait
-      pushLog(name, "system", "⚠ Duplicate session on server. Waiting 3 minutes for it to expire...");
-
+      delay = 3 * 60 * 1000; // 3 min — old session still alive
+      s.reconnDelay = 60000;
+      addLog(name, "system", "Duplicate session — waiting 3 min");
     } else {
-      // Normal disconnect — use exponential backoff
-      delay = bots[name].reconnectDelay ?? 60000;
-      // Double for next time, cap at 5 minutes
-      bots[name].reconnectDelay = Math.min(delay * 2, 300000);
+      delay = s.reconnDelay;
+      s.reconnDelay = Math.min(s.reconnDelay * 2, 5 * 60 * 1000); // backoff, cap 5 min
     }
 
-    // Add up to 20s of random jitter so bots never reconnect in a synchronized
-    // burst after a mass disconnect (which is what causes throttle kicks)
-    const jitter = Math.floor(Math.random() * 20000);
-    const jitteredDelay = delay + jitter;
+    // Add jitter (0–20 s) so bots never reconnect in a burst
+    const jitter   = Math.floor(Math.random() * 20000);
+    const total    = delay + jitter;
+    const label    = total >= 60000
+      ? `${Math.floor(total / 60000)}m ${Math.round((total % 60000) / 1000)}s`
+      : `${Math.round(total / 1000)}s`;
 
-    setStatus(name, "reconnecting");
-    const delaySec = Math.round(jitteredDelay / 1000);
-    const delayLabel = delaySec >= 60 ? `${Math.floor(delaySec / 60)}m ${delaySec % 60}s` : `${delaySec}s`;
-    pushLog(name, "system", `Reconnecting in ${delayLabel}...`);
+    s.status   = "reconnecting";
+    s.reconnAt = Date.now() + total;
+    addLog(name, "system", `Reconnecting in ${label}...`);
 
-    // Store the epoch time when the next attempt fires — used for countdown
-    bots[name].reconnectAt = Date.now() + jitteredDelay;
-
-    bots[name].reconnectTimer = setTimeout(() => {
-      if (bots[name]?.shouldReconnect) {
-        bots[name].reconnectAt = null;
-        createBot(name);
-      }
-    }, delay);
+    s.reconnTimer = setTimeout(() => {
+      s.reconnAt = null;
+      if (!s._stopped) createBot(name);
+    }, total);
   });
-
-  // ---- ERROR ----
-  instance.on("error", (err) => {
-    // Don't log ECONNRESET separately — it always triggers "end" too,
-    // which avoids duplicate error+disconnect messages in the console.
-    if (err.code === "ECONNRESET" || err.code === "ECONNREFUSED") return;
-    pushLog(name, "error", "ERROR: " + err.message);
-  });
-
-  return instance;
 }
 
-// ================= STOP BOT =================
-// Extracted into a helper so both the /stop route
-// and internal cleanup use the same logic.
+// ─────────────────────────────────────────
+//  STOP HELPER
+// ─────────────────────────────────────────
 
 function stopBot(name) {
-  const state = bots[name];
-  if (!state) return;
+  const s = state[name];
+  if (!s) return;
 
-  // Prevent reconnect loop
-  state.shouldReconnect = false;
+  s._stopped = true;
+  cancelReconn(name);
+  stopAfk(name);
+  s.gen += 1; // invalidate all in-flight events
 
-  // Clear all timers
-  if (state.reconnectTimer) {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
-  }
-  if (state.stableTimer) {
-    clearTimeout(state.stableTimer);
-    state.stableTimer = null;
-  }
-  if (state.afkInterval) {
-    clearInterval(state.afkInterval);
-    state.afkInterval = null;
+  if (s.inst) {
+    try { s.inst.quit(); } catch {}
+    s.inst = null;
   }
 
-  // Invalidate instance ID so any in-flight events are ignored
-  state.instanceId = null;
-
-  // Disconnect the bot if it exists
-  if (state.instance) {
-    try { state.instance.quit(); } catch {}
-    state.instance = null;
-  }
-
-  setStatus(name, "stopped");
-  pushLog(name, "system", "Bot stopped.");
+  s.status      = "stopped";
+  s.reconnDelay = 60000; // reset backoff for next manual start
+  addLog(name, "system", "Bot stopped.");
 }
 
-// ================= WEBSITE =================
+// ─────────────────────────────────────────
+//  ROUTES
+// ─────────────────────────────────────────
+
+// /data — polled every second by the frontend
+app.get("/data", (req, res) => {
+  const out = {};
+  for (const b of BOT_LIST) {
+    const s = state[b.name];
+    out[b.name] = {
+      status:    s.status,
+      reconnAt:  s.reconnAt,
+      logs:      s.logs,
+    };
+  }
+  res.json(out);
+});
+
+// /send — chat message
+app.post("/send", (req, res) => {
+  const { bot, msg } = req.body;
+  const s = state[bot];
+  if (!s || !s.inst) return res.sendStatus(404);
+  try {
+    s.inst.chat(String(msg));
+    addLog(bot, "chat", `<YOU> ${msg}`);
+    res.sendStatus(200);
+  } catch { res.sendStatus(500); }
+});
+
+// /start
+app.post("/start", (req, res) => {
+  const { bot } = req.body;
+  const s = state[bot];
+  if (!s) return res.sendStatus(400);
+  if (s.status === "online" || s.status === "connecting") return res.sendStatus(200);
+  s._stopped = false;
+  createBot(bot);
+  res.sendStatus(200);
+});
+
+// /stop
+app.post("/stop", (req, res) => {
+  const { bot } = req.body;
+  if (!state[bot]) return res.sendStatus(400);
+  stopBot(bot);
+  res.sendStatus(200);
+});
+
+// ─────────────────────────────────────────
+//  DASHBOARD HTML
+// ─────────────────────────────────────────
 
 app.get("/", (req, res) => {
   res.send(`<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Karma Bot Manager</title>
 <style>
-
-*, *::before, *::after { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-  margin: 0;
+  font-family: Consolas, 'Courier New', monospace;
+  background: radial-gradient(circle at 20% 20%, #1e293b 0%, #020617 100%);
+  color: #e2e8f0;
   height: 100vh;
   display: flex;
-  font-family: Consolas, monospace;
-  color: white;
-  background: radial-gradient(circle at top left, #1e293b, #020617);
   overflow: hidden;
 }
 
-/* ---- LEFT PANEL ---- */
+/* ── LEFT ── */
 .left {
   flex: 1;
   display: flex;
   flex-direction: column;
-  padding: 12px;
+  padding: 14px;
   min-width: 0;
+  gap: 10px;
 }
 
 .tabs {
   display: flex;
-  gap: 10px;
-  margin-bottom: 10px;
-  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .tab {
-  padding: 10px 16px;
-  background: #161b22;
-  border: none;
-  border-radius: 12px;
-  color: white;
-  cursor: pointer;
-  transition: .25s;
   display: flex;
   align-items: center;
   gap: 7px;
-  font-family: Consolas, monospace;
-  font-size: 14px;
+  padding: 9px 18px;
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 10px;
+  color: #94a3b8;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  transition: all .2s;
 }
-.tab:hover { transform: translateY(-2px); }
+.tab:hover { color: #fff; border-color: #334155; }
 .tab.active {
-  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
-  box-shadow: 0 0 18px #3b82f6;
+  background: linear-gradient(135deg,#3b82f6,#8b5cf6);
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 0 20px rgba(59,130,246,.4);
 }
 
-/* Status dot on tab */
 .dot {
-  width: 8px;
-  height: 8px;
+  width: 7px; height: 7px;
   border-radius: 50%;
-  background: #555;
+  background: #334155;
   flex-shrink: 0;
 }
-.dot.online    { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
-.dot.offline   { background: #ef4444; }
-.dot.reconnecting { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
-.dot.connecting   { background: #38bdf8; box-shadow: 0 0 6px #38bdf8; }
-.dot.stopped   { background: #555; }
+.dot.online      { background: #22c55e; box-shadow: 0 0 5px #22c55e; }
+.dot.connecting  { background: #38bdf8; box-shadow: 0 0 5px #38bdf8; }
+.dot.reconnecting{ background: #f59e0b; box-shadow: 0 0 5px #f59e0b; }
+.dot.offline     { background: #ef4444; }
+.dot.stopped     { background: #334155; }
 
-/* ---- CONSOLE ---- */
 .console {
   flex: 1;
-  background: rgba(255,255,255,.04);
-  backdrop-filter: blur(16px);
-  border: 1px solid rgba(255,255,255,.08);
-  border-radius: 18px;
-  padding: 12px;
+  background: rgba(255,255,255,.03);
+  border: 1px solid rgba(255,255,255,.07);
+  border-radius: 14px;
+  padding: 12px 14px;
   overflow-y: auto;
-  overflow-x: hidden;
   font-size: 13px;
-  box-shadow: 0 0 35px rgba(59,130,246,.15);
-  transition: opacity .2s ease;
-  /* FIX: use content-visibility for better scroll performance */
-  contain: layout style;
+  line-height: 1.6;
+  transition: opacity .15s;
 }
+.console::-webkit-scrollbar { width: 5px; }
+.console::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
 
 .line {
   display: grid;
-  grid-template-columns: 80px 110px 1fr;
-  gap: 8px;
-  margin-bottom: 3px;
-  line-height: 1.5;
-}
-
-.time   { color: #4b5563; }
-.sender { font-weight: bold; }
-
-/* Log type colours */
-.type-system { color: #94a3b8; }
-.type-chat   { color: #e2e8f0; }
-.type-join   { color: #22c55e; }
-.type-leave  { color: #f87171; }
-.type-error  { color: #f87171; font-weight: bold; }
-.type-server { color: #94a3b8; }
-
-.sender-system { color: #4b5563; }
-.sender-chat   { color: #38bdf8; }
-.sender-join   { color: #22c55e; }
-.sender-leave  { color: #f87171; }
-.sender-error  { color: #f87171; }
-.sender-server { color: #4b5563; }
-
-/* ---- INPUT BAR ---- */
-.inputBar {
-  display: flex;
+  grid-template-columns: 72px 80px 1fr;
   gap: 10px;
-  margin-top: 10px;
+  padding: 1px 0;
 }
+.t  { color: #334155; font-size: 12px; }
+.lbl{ font-weight: 700; }
 
-.input {
+.lbl-system { color: #475569; }
+.lbl-server { color: #475569; }
+.lbl-chat   { color: #38bdf8; }
+.lbl-join   { color: #22c55e; }
+.lbl-leave  { color: #f87171; }
+.lbl-error  { color: #f87171; }
+
+.msg-system { color: #64748b; }
+.msg-server { color: #94a3b8; }
+.msg-chat   { color: #e2e8f0; }
+.msg-join   { color: #22c55e; }
+.msg-leave  { color: #f87171; }
+.msg-error  { color: #fca5a5; font-weight: 600; }
+
+.bar {
+  display: flex;
+  gap: 8px;
+}
+.bar input {
   flex: 1;
-  padding: 12px;
-  background: #111;
-  border: 1px solid #333;
+  padding: 11px 14px;
+  background: #0f172a;
+  border: 1px solid #1e293b;
   border-radius: 10px;
-  color: white;
-  font-family: Consolas, monospace;
+  color: #e2e8f0;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color .2s;
 }
-.input:focus { outline: none; border-color: #3b82f6; }
-
-.send {
-  width: 100px;
-  border: none;
+.bar input:focus { border-color: #3b82f6; }
+.bar button {
+  padding: 11px 24px;
   background: #2563eb;
-  color: white;
+  border: none;
   border-radius: 10px;
+  color: #fff;
+  font-family: inherit;
+  font-weight: 700;
   cursor: pointer;
-  font-family: Consolas, monospace;
-  font-weight: bold;
-  transition: .2s;
+  transition: background .2s;
 }
-.send:hover { background: #3b82f6; transform: translateY(-1px); }
+.bar button:hover { background: #3b82f6; }
 
-/* ---- RIGHT PANEL ---- */
+/* ── RIGHT ── */
 .right {
-  width: 320px;
-  background: #0d1117;
-  padding: 12px;
-  overflow: auto;
-  border-left: 1px solid #1e293b;
+  width: 280px;
+  background: #080e1a;
+  border-left: 1px solid #0f172a;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .panel {
-  background: rgba(255,255,255,.05);
-  backdrop-filter: blur(16px);
-  border: 1px solid rgba(255,255,255,.08);
-  border-radius: 18px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(255,255,255,.07);
+  border-radius: 14px;
   padding: 16px;
-  margin-bottom: 12px;
-  box-shadow: 0 0 30px rgba(59,130,246,.12);
 }
 
 .panel h2 {
-  margin: 0 0 4px 0;
-  font-size: 24px;
-  letter-spacing: 1px;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: .5px;
+  margin-bottom: 8px;
 }
 
-.statusLabel {
-  font-size: 12px;
-  padding: 3px 10px;
-  border-radius: 999px;
+.badge {
   display: inline-block;
-  margin-bottom: 12px;
-  font-weight: bold;
+  padding: 3px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
   text-transform: uppercase;
+  letter-spacing: .5px;
+  margin-bottom: 14px;
 }
-.statusLabel.online      { background: #14532d; color: #22c55e; }
-.statusLabel.offline     { background: #450a0a; color: #f87171; }
-.statusLabel.reconnecting{ background: #451a03; color: #f59e0b; }
-.statusLabel.connecting  { background: #0c2a3d; color: #38bdf8; }
-.statusLabel.stopped     { background: #1e293b; color: #64748b; }
+.badge.online       { background:#14532d; color:#22c55e; }
+.badge.connecting   { background:#0c2a3d; color:#38bdf8; }
+.badge.reconnecting { background:#451a03; color:#f59e0b; }
+.badge.offline      { background:#450a0a; color:#f87171; }
+.badge.stopped      { background:#1e293b; color:#475569; }
 
-.btns {
-  display: flex;
-  gap: 10px;
-}
-
-.small {
+.btns { display: flex; gap: 8px; }
+.btn {
   flex: 1;
-  padding: 12px;
+  padding: 11px;
   border: none;
-  border-radius: 12px;
+  border-radius: 10px;
+  color: #fff;
+  font-family: inherit;
+  font-weight: 700;
+  font-size: 13px;
   cursor: pointer;
-  color: white;
-  font-weight: bold;
-  font-family: Consolas, monospace;
-  transition: .2s;
+  transition: all .2s;
 }
-.small:hover { transform: translateY(-2px); }
-.green { background: #16a34a; }
-.green:hover { background: #22c55e; }
-.red   { background: #dc2626; }
-.red:hover { background: #ef4444; }
-
-/* Scrollbar styling */
-.console::-webkit-scrollbar { width: 6px; }
-.console::-webkit-scrollbar-track { background: transparent; }
-.console::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
-
+.btn:hover { transform: translateY(-1px); filter: brightness(1.15); }
+.btn-green { background: #16a34a; }
+.btn-red   { background: #dc2626; }
 </style>
 </head>
 <body>
 
 <div class="left">
-
-  <div class="tabs">
-    <button id="DeadmauTab"   class="tab active" onclick="switchBot('Deadmau5')">
-      <span class="dot" id="dot-Deadmau5"></span>Deadmau5
-    </button>
-    <button id="PrinceTab"    class="tab"        onclick="switchBot('Prince')">
-      <span class="dot" id="dot-Prince"></span>Prince
-    </button>
-    <button id="Wemmbu_AltTab" class="tab"       onclick="switchBot('Wemmbu_Alt')">
-      <span class="dot" id="dot-Wemmbu_Alt"></span>Wemmbu_Alt
-    </button>
-  </div>
-
+  <div class="tabs" id="tabs"></div>
   <div class="console" id="console"></div>
-
-  <div class="inputBar">
-    <input id="cmd" class="input" placeholder="Send message or /command">
-    <button class="send" onclick="sendMsg()">SEND</button>
+  <div class="bar">
+    <input id="cmd" placeholder="Send message or /command" />
+    <button onclick="sendMsg()">SEND</button>
   </div>
-
 </div>
 
 <div class="right">
   <div class="panel">
-    <h2 id="activeName">Deadmau5</h2>
-    <span class="statusLabel stopped" id="statusLabel">Stopped</span>
+    <h2 id="botName">-</h2>
+    <div class="badge stopped" id="badge">Stopped</div>
     <div class="btns">
-      <button class="small green" onclick="startBot()">START</button>
-      <button class="small red"   onclick="stopBot()">STOP</button>
+      <button class="btn btn-green" onclick="startBot()">START</button>
+      <button class="btn btn-red"   onclick="stopBotUI()">STOP</button>
     </div>
   </div>
 </div>
 
 <script>
+const BOT_NAMES = ${JSON.stringify(BOT_LIST.map(b => b.name))};
 
-let currentBot = "Deadmau5";
-// FIX: Track last log count to skip full re-render when nothing changed
-let lastLogCount = {};
+let current      = BOT_NAMES[0];
+let lastCount    = {};   // bot -> log count, used to skip pointless re-renders
+let countdownTid = null;
 
-// ---- SENDER LABEL BY TYPE ----
-const senderLabel = {
-  system:      "SYSTEM",
-  server:      "SERVER",
-  chat:        null,   // extracted from message
-  join:        "JOIN",
-  leave:       "LEAVE",
-  error:       "ERROR",
-};
-
-// ---- RENDER A LOG ENTRY TO HTML ----
-function renderLine(entry) {
-  let sender = senderLabel[entry.type] ?? "SERVER";
-  let text    = entry.text;
-
-  // For chat lines, extract <PlayerName> as the sender
-  if (entry.type === "chat") {
-    const m = text.match(/^<([^>]+)>\s?(.+)/);
-    if (m) { sender = m[1]; text = m[2]; }
-  }
-
-  return \`<div class="line">
-    <span class="time">\${entry.t}</span>
-    <span class="sender sender-\${entry.type}">\${escHtml(sender)}</span>
-    <span class="msg type-\${entry.type}">\${escHtml(text)}</span>
-  </div>\`;
+// ── BUILD TABS ──────────────────────────────────────────
+for (const name of BOT_NAMES) {
+  const btn = document.createElement("button");
+  btn.className  = "tab" + (name === current ? " active" : "");
+  btn.id         = "tab-" + name;
+  btn.innerHTML  = \`<span class="dot" id="dot-\${name}"></span>\${name}\`;
+  btn.onclick    = () => switchBot(name);
+  document.getElementById("tabs").appendChild(btn);
+  lastCount[name] = -1;
 }
 
-function escHtml(s) {
+// ── ESCAPE HTML ──────────────────────────────────────────
+function esc(s) {
   return String(s)
     .replace(/&/g,"&amp;")
     .replace(/</g,"&lt;")
     .replace(/>/g,"&gt;");
 }
 
-// ---- STATUS BADGE ----
-let countdownInterval = null;
+// ── RENDER A SINGLE LOG LINE ─────────────────────────────
+const LBL = { system:"SYS", server:"SERVER", chat:"CHAT", join:"JOIN", leave:"LEAVE", error:"ERROR" };
 
-function applyStatus(status, reconnectAt) {
-  const label = document.getElementById("statusLabel");
-  const baseText = {
-    online:       "Online",
-    offline:      "Disconnected",
-    reconnecting: "Reconnecting",
-    connecting:   "Connecting…",
-    stopped:      "Stopped"
-  };
+function renderLine(e) {
+  const lbl = LBL[e.type] || "INFO";
+  let   txt = esc(e.text);
 
-  label.className = "statusLabel " + status;
+  // For chat lines show <Player> as label
+  if (e.type === "chat") {
+    const m = e.text.match(/^<([^>]+)>\\s?(.+)/);
+    if (m) {
+      return \`<div class="line">
+        <span class="t">\${e.t}</span>
+        <span class="lbl lbl-chat">\${esc(m[1])}</span>
+        <span class="msg-chat">\${esc(m[2])}</span>
+      </div>\`;
+    }
+  }
 
-  if (status === "reconnecting" && reconnectAt) {
-    // Clear any existing countdown ticker
-    if (countdownInterval) clearInterval(countdownInterval);
+  return \`<div class="line">
+    <span class="t">\${e.t}</span>
+    <span class="lbl lbl-\${e.type}">\${lbl}</span>
+    <span class="msg-\${e.type}">\${txt}</span>
+  </div>\`;
+}
 
+// ── STATUS BADGE + COUNTDOWN ─────────────────────────────
+const BADGE_TEXT = {
+  online:"Online", connecting:"Connecting…",
+  reconnecting:"Reconnecting", offline:"Offline", stopped:"Stopped"
+};
+
+function updateBadge(status, reconnAt) {
+  const el = document.getElementById("badge");
+  el.className = "badge " + status;
+
+  if (countdownTid) { clearInterval(countdownTid); countdownTid = null; }
+
+  if (status === "reconnecting" && reconnAt) {
     const tick = () => {
-      const secsLeft = Math.max(0, Math.round((reconnectAt - Date.now()) / 1000));
-      if (secsLeft >= 60) {
-        const m = Math.floor(secsLeft / 60);
-        const s = secsLeft % 60;
-        label.textContent = \`Reconnecting in \${m}m \${s}s\`;
-      } else {
-        label.textContent = \`Reconnecting in \${secsLeft}s\`;
-      }
-      if (secsLeft <= 0) clearInterval(countdownInterval);
+      const s = Math.max(0, Math.round((reconnAt - Date.now()) / 1000));
+      el.textContent = s >= 60
+        ? \`In \${Math.floor(s/60)}m \${s%60}s\`
+        : \`In \${s}s\`;
+      if (s <= 0) { clearInterval(countdownTid); el.textContent = "Reconnecting…"; }
     };
-
     tick();
-    countdownInterval = setInterval(tick, 1000);
+    countdownTid = setInterval(tick, 1000);
   } else {
-    if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
-    label.textContent = baseText[status] ?? status;
+    el.textContent = BADGE_TEXT[status] || status;
   }
 }
 
-// ---- REFRESH ----
+// ── REFRESH (called every second) ───────────────────────
 async function refresh() {
+  let data;
   try {
-    const res  = await fetch("/data");
-    const data = await res.json();
+    const r = await fetch("/data");
+    data = await r.json();
+  } catch { return; }
 
-    // Update all status dots
-    for (const [name, info] of Object.entries(data)) {
-      const dot = document.getElementById("dot-" + name);
-      if (dot) {
-        dot.className = "dot " + info.status;
-      }
-    }
+  // Update dots on all tabs
+  for (const name of BOT_NAMES) {
+    const dot = document.getElementById("dot-" + name);
+    if (dot) dot.className = "dot " + (data[name]?.status || "stopped");
+  }
 
-    const info = data[currentBot];
-    if (!info) return;
+  const info = data[current];
+  if (!info) return;
 
-    applyStatus(info.status, info.reconnectAt);
+  // Update sidebar badge
+  document.getElementById("botName").textContent = current;
+  updateBadge(info.status, info.reconnAt);
 
-    const consoleDiv = document.getElementById("console");
+  // Only re-render console if log count changed
+  const con = document.getElementById("console");
+  if (lastCount[current] === info.logs.length) return;
+  lastCount[current] = info.logs.length;
 
-    // FIX: Only re-render if log count changed
-    if ((lastLogCount[currentBot] ?? -1) === info.logs.length) return;
-    lastLogCount[currentBot] = info.logs.length;
-
-    const nearBottom =
-      consoleDiv.scrollHeight - consoleDiv.scrollTop - consoleDiv.clientHeight < 80;
-
-    consoleDiv.innerHTML = info.logs.map(renderLine).join("");
-
-    if (nearBottom) {
-      consoleDiv.scrollTop = consoleDiv.scrollHeight;
-    }
-  } catch {}
+  const atBottom = con.scrollHeight - con.scrollTop - con.clientHeight < 80;
+  con.innerHTML = info.logs.map(renderLine).join("");
+  if (atBottom) con.scrollTop = con.scrollHeight;
 }
 
-// ---- SWITCH BOT ----
+// ── SWITCH BOT TAB ───────────────────────────────────────
 function switchBot(name) {
-  currentBot = name;
-  document.getElementById("activeName").textContent = name;
-  document.querySelectorAll(".tab").forEach(e => e.classList.remove("active"));
-
-  // Map name to tab ID
-  const tabMap = { Deadmau5: "DeadmauTab", Prince: "PrinceTab", Wemmbu_Alt: "Wemmbu_AltTab" };
-  document.getElementById(tabMap[name])?.classList.add("active");
-
-  const consoleDiv = document.getElementById("console");
-  consoleDiv.style.opacity = 0;
-  lastLogCount[name] = -1; // force re-render
-  setTimeout(() => {
-    refresh();
-    consoleDiv.style.opacity = 1;
-  }, 150);
+  document.getElementById("tab-" + current)?.classList.remove("active");
+  current = name;
+  document.getElementById("tab-" + name)?.classList.add("active");
+  lastCount[name] = -1;
+  const con = document.getElementById("console");
+  con.style.opacity = "0";
+  setTimeout(() => { refresh(); con.style.opacity = "1"; }, 120);
 }
 
-// ---- SEND ----
+// ── SEND ─────────────────────────────────────────────────
 async function sendMsg() {
   const msg = document.getElementById("cmd").value.trim();
   if (!msg) return;
-
+  document.getElementById("cmd").value = "";
   await fetch("/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bot: currentBot, msg }),
+    body: JSON.stringify({ bot: current, msg })
   });
-
-  document.getElementById("cmd").value = "";
 }
 
-// ---- START / STOP ----
+// ── START / STOP ─────────────────────────────────────────
 async function startBot() {
   await fetch("/start", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bot: currentBot }),
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ bot: current })
   });
 }
-
-async function stopBot() {
+async function stopBotUI() {
   await fetch("/stop", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ bot: currentBot }),
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ bot: current })
   });
 }
 
-// ---- ENTER KEY ----
+// ── ENTER KEY ────────────────────────────────────────────
 document.getElementById("cmd").addEventListener("keypress", e => {
   if (e.key === "Enter") sendMsg();
 });
 
-// ---- POLL ----
+// ── POLL ─────────────────────────────────────────────────
 setInterval(refresh, 1000);
 refresh();
-
 </script>
 </body>
 </html>`);
 });
 
-// ================= DEBUG =================
-// Visit /debug in your browser to see raw bot state.
-// Useful for diagnosing version mismatches and timer state.
+// ─────────────────────────────────────────
+//  AUTO START (staggered — 15 s apart)
+// ─────────────────────────────────────────
 
-app.get("/debug", (req, res) => {
-  const out = {};
-  for (const name of Object.keys(BOT_CONFIGS)) {
-    const state = bots[name] ?? {};
-    out[name] = {
-      status:         state.status,
-      instanceId:     state.instanceId,
-      shouldReconnect:state.shouldReconnect,
-      reconnectDelay: state.reconnectDelay,
-      hasInstance:    !!state.instance,
-      version:        state.instance?._client?.version ?? null,
-    };
-  }
-  res.json(out);
-});
-
-// ================= DATA =================
-
-app.get("/data", (req, res) => {
-  const out = {};
-  for (const name of Object.keys(BOT_CONFIGS)) {
-    out[name] = {
-      status:      getStatus(name),
-      logs:        logs[name] ?? [],
-      reconnectAt: bots[name]?.reconnectAt ?? null, // epoch ms when next attempt fires
-    };
-  }
-  res.json(out);
-});
-
-// ================= SEND =================
-
-app.post("/send", (req, res) => {
-  const { bot: name, msg } = req.body;
-  if (!name || !msg) return res.sendStatus(400);
-
-  const instance = bots[name]?.instance;
-  if (!instance || getStatus(name) !== "online") return res.sendStatus(404);
-
-  try {
-    instance.chat(msg.toString());
-    pushLog(name, "chat", `<YOU> ${msg}`);
-    res.sendStatus(200);
-  } catch {
-    res.sendStatus(500);
-  }
-});
-
-// ================= START =================
-
-app.post("/start", (req, res) => {
-  const name = req.body.bot;
-  if (!BOT_CONFIGS[name]) return res.sendStatus(400);
-
-  const status = getStatus(name);
-
-  // Don't double-start
-  if (status === "online" || status === "connecting") {
-    return res.sendStatus(200);
-  }
-
-  createBot(name);
-  res.sendStatus(200);
-});
-
-// ================= STOP =================
-
-app.post("/stop", (req, res) => {
-  const name = req.body.bot;
-  if (!BOT_CONFIGS[name]) return res.sendStatus(400);
-  stopBot(name);
-  res.sendStatus(200);
-});
-
-// ================= AUTO START =================
-// Stagger startup: bot 0 at 0s, bot 1 at 15s, bot 2 at 30s.
-// This prevents all 3 hitting the server simultaneously,
-// which is what triggers "Connection throttled".
-
-const BOT_NAMES = Object.keys(BOT_CONFIGS);
-BOT_NAMES.forEach((name, i) => {
-  if (i === 0) {
-    createBot(name);
+BOT_LIST.forEach((cfg, i) => {
+  const delay = i * 15000;
+  if (delay === 0) {
+    createBot(cfg.name);
   } else {
-    const delaySec = i * 15;
-    pushLog(name, "system", `Startup staggered — connecting in ${delaySec}s...`);
-    setTimeout(() => createBot(name), i * 15000);
+    addLog(cfg.name, "system", `Startup in ${i * 15}s...`);
+    setTimeout(() => createBot(cfg.name), delay);
   }
 });
 
-// ================= SERVER =================
+// ─────────────────────────────────────────
+//  SERVER
+// ─────────────────────────────────────────
 
-app.listen(3000, "0.0.0.0", () => {
-  console.log("Dashboard running on port 3000");
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Dashboard running on port ${PORT}`);
 });
